@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Golden Hour Meadow · Three.js</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #f0a86a; }
+  canvas { display: block; }
+  #hint {
+    position: fixed; left: 12px; bottom: 10px; pointer-events: none;
+    font: 13px/1.3 system-ui, sans-serif; color: #fff4e6;
+    background: rgba(40, 20, 10, .35); padding: 6px 10px; border-radius: 6px;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="hint">Drag to orbit · scroll to zoom · right-drag to pan</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Reflector } from 'three/addons/objects/Reflector.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+/* ------------------------------------------------------------------ *
+ *  Helpers
+ * ------------------------------------------------------------------ */
+const rand = (() => {                       // seeded PRNG → same scene every load
+  let s = 20260417;
+  return () => {
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+})();
+const rr = (a, b) => a + (b - a) * rand();
+const pick = (arr) => arr[(rand() * arr.length) | 0];
+const sm = (a, b, x) => {                   // smoothstep that also works when a > b
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+};
+const ringPoint = (rMin, rMax, ang = rr(0, Math.PI * 2)) => {
+  const r = Math.sqrt(rr(rMin * rMin, rMax * rMax));   // area-uniform
+  return [Math.cos(ang) * r, Math.sin(ang) * r, ang];
+};
+const std = (color, extra = {}) =>
+  new THREE.MeshStandardMaterial({ color, roughness: 0.9, metalness: 0, flatShading: true, ...extra });
+const paint = (geo, hex) => {               // per-vertex color (used by merged props)
+  const c = new THREE.Color(hex), n = geo.attributes.position.count, a = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { a[i * 3] = c.r; a[i * 3 + 1] = c.g; a[i * 3 + 2] = c.b; }
+  geo.setAttribute('color', new THREE.BufferAttribute(a, 3));
+  return geo;
+};
+const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _s = new THREE.Vector3(),
+      _p = new THREE.Vector3(), _e = new THREE.Euler();
+const place = (mesh, i, x, y, z, ry = 0, sx = 1, sy = 1, sz = 1, rx = 0, rz = 0) => {
+  _p.set(x, y, z); _e.set(rx, ry, rz); _q.setFromEuler(_e); _s.set(sx, sy, sz);
+  mesh.setMatrixAt(i, _m.compose(_p, _q, _s));
+};
+
+/* Wind: patch a material so vertices bend in proportion to their height.
+   Only used on InstancedMesh props (grass, reeds, flowers). */
+const wind = { value: 0 };
+function sway(material, amp, speed) {
+  material.onBeforeCompile = (sh) => {
+    sh.uniforms.uTime = wind;
+    sh.vertexShader = 'uniform float uTime;\n' + sh.vertexShader.replace(
+      '#include <begin_vertex>',
+      `#include <begin_vertex>
+      vec3 root = vec3(instanceMatrix[3].x, 0.0, instanceMatrix[3].z);
+      float bend = max(position.y, 0.0);
+      float gust = sin(uTime * ${speed.toFixed(2)} + root.x * 0.8 + root.z * 0.6)
+                 + 0.4 * sin(uTime * 2.3 + root.z * 1.7);
+      transformed.x += gust * bend * ${amp.toFixed(3)};
+      transformed.z += gust * bend * ${(amp * 0.5).toFixed(3)};`
+    );
+  };
+  material.customProgramCacheKey = () => `sway-${amp}-${speed}`;
+  return material;
+}
+
+/* ------------------------------------------------------------------ *
+ *  Renderer / scene / camera
+ * ------------------------------------------------------------------ */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0xf0a86a, 45, 150);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 400);
+camera.position.set(18, 7, 22);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.2, 0);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI * 0.49;
+controls.minDistance = 6;
+controls.maxDistance = 70;
+controls.update();
+
+/* ------------------------------------------------------------------ *
+ *  Sky + golden-hour sun
+ * ------------------------------------------------------------------ */
+const SUN_DIR = new THREE.Vector3(-0.8, 0.22, -0.55).normalize();   // low, backlit
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(300, 32, 16),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false, toneMapped: false,
+    uniforms: { uSunDir: { value: SUN_DIR } },
+    vertexShader: `
+      varying vec3 vDir;
+      void main() { vDir = normalize(position);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+    fragmentShader: `
+      uniform vec3 uSunDir; varying vec3 vDir;
+      void main() {
+        float h = clamp(vDir.y, 0.0, 1.0);
+        vec3 horizon = vec3(1.00, 0.62, 0.32);
+        vec3 mid     = vec3(0.98, 0.74, 0.52);
+        vec3 zenith  = vec3(0.36, 0.50, 0.72);
+        vec3 col = mix(horizon, mid, smoothstep(0.0, 0.15, h));
+        col = mix(col, zenith, smoothstep(0.15, 0.7, h));
+        float sd = max(dot(normalize(vDir), uSunDir), 0.0);
+        col += vec3(1.0, 0.6, 0.25) * pow(sd, 8.0) * 0.5;
+        col += vec3(1.0, 0.92, 0.75) * pow(sd, 400.0);
+        gl_FragColor = vec4(col, 1.0);
+      }`,
+  })
+);
+scene.add(sky);
+
+const sun = new THREE.DirectionalLight(0xffa35c, 2.6);
+sun.position.copy(SUN_DIR).multiplyScalar(60);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -38, right: 38, top: 38, bottom: -38, near: 1, far: 160 });
+sun.shadow.camera.updateProjectionMatrix();
+sun.shadow.bias = -0.0008;
+sun.shadow.normalBias = 0.03;
+scene.add(sun, sun.target);
+scene.add(new THREE.HemisphereLight(0xffd6a0, 0x4a5a2a, 0.9));
+
+/* ------------------------------------------------------------------ *
+ *  Terrain with a pond basin
+ * ------------------------------------------------------------------ */
+const POND_R = 7, WATER_Y = -0.5, DOCK_A = 0.7;
+
+function groundH(x, z) {
+  const r = Math.hypot(x, z);
+  const h = 0.45
+    + 0.30 * Math.sin(x * 0.17 + 1.3)
+    + 0.28 * Math.cos(z * 0.13 - x * 0.05)
+    + 0.25 * Math.sin((x * x + z * z) * 0.008)
+    + Math.max(0, r - 30) * 0.03;
+  const basin = sm(POND_R + 2.4, POND_R - 0.4, r);     // 1 at the pond centre
+  return h + (-1.3 - h) * basin;
+}
+
+const terrainGeo = new THREE.PlaneGeometry(200, 200, 100, 100).rotateX(-Math.PI / 2);
+{
+  const pos = terrainGeo.attributes.position, cols = [];
+  const grassA = new THREE.Color('#84a64c'), grassB = new THREE.Color('#5d8a3c');
+  const dry = new THREE.Color('#b59a57'), mud = new THREE.Color('#6b5a3a');
+  const c = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i), r = Math.hypot(x, z);
+    pos.setY(i, groundH(x, z));
+    const n = 0.5 + 0.5 * Math.sin(x * 0.6 + z * 0.3) * Math.cos(z * 0.5 - x * 0.2);
+    c.copy(grassA).lerp(grassB, n);
+    c.lerp(mud, sm(POND_R + 2.2, POND_R + 0.5, r));
+    c.lerp(dry, sm(24, 40, r) * 0.5);
+    cols.push(c.r, c.g, c.b);
+  }
+  terrainGeo.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+  terrainGeo.computeVertexNormals();
+}
+const terrain = new THREE.Mesh(terrainGeo, std(0xffffff, { vertexColors: true }));
+terrain.receiveShadow = true;
+scene.add(terrain);
+
+/* Pond surface: planar reflection, tinted toward a dusk teal */
+const water = new Reflector(new THREE.CircleGeometry(POND_R + 1.7, 56), {
+  textureWidth: 1024, textureHeight: 1024, clipBias: 0.003, color: 0x7f9aa0,
+});
+water.rotation.x = -Math.PI / 2;
+water.position.y = WATER_Y;
+scene.add(water);
+
+/* ------------------------------------------------------------------ *
+ *  Trees around the edges
+ * ------------------------------------------------------------------ */
+const trees = new THREE.Group();
+const canopyCols = ['#4d8a3a', '#5f9a44', '#3e7534', '#6fa04a', '#a0b64d'];
+const dockClear = (ang, r) => Math.abs(Math.atan2(Math.sin(ang - DOCK_A), Math.cos(ang - DOCK_A))) < 0.35 && r < POND_R + 9;
+
+for (let placed = 0; placed < 24;) {
+  const [x, z, ang] = ringPoint(POND_R + 6, 34);
+  if (dockClear(ang, Math.hypot(x, z))) continue;
+  placed++;
+
+  const tree = new THREE.Group();
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.34, 2.4, 5), std('#6b4a2e'));
+  trunk.position.y = 1.2; trunk.castShadow = true;
+  tree.add(trunk);
+  for (const [bx, by, bz, br] of [[0, 3.4, 0, 1.9], [-0.9, 2.8, 0.4, 1.3], [0.8, 3.0, -0.5, 1.4]]) {
+    const blob = new THREE.Mesh(new THREE.IcosahedronGeometry(br, 0), std(pick(canopyCols)));
+    blob.position.set(bx, by, bz);
+    blob.castShadow = blob.receiveShadow = true;
+    tree.add(blob);
+  }
+  tree.position.set(x, groundH(x, z) - 0.1, z);
+  tree.rotation.y = rand() * Math.PI * 2;
+  tree.scale.setScalar(rr(0.9, 1.4));
+  trees.add(tree);
+}
+scene.add(trees);
+
+/* ------------------------------------------------------------------ *
+ *  Mossy rocks along the shore
+ * ------------------------------------------------------------------ */
+function makeRock() {
+  const g = new THREE.IcosahedronGeometry(0.7, 0);
+  const p = g.attributes.position, jitter = new Map();
+  for (let i = 0; i < p.count; i++) {       // same corner → same offset, so faces stay closed
+    const key = [p.getX(i), p.getY(i), p.getZ(i)].map((v) => v.toFixed(3)).join();
+    if (!jitter.has(key)) jitter.set(key, rr(0.8, 1.2));
+    const k = jitter.get(key);
+    p.setXYZ(i, p.getX(i) * k, p.getY(i) * k * 0.7, p.getZ(i) * k);
+  }
+  g.translate(0, 0.3, 0);
+  g.computeVertexNormals();
+  const n = g.attributes.normal, col = new Float32Array(p.count * 3);
+  const stone = new THREE.Color('#8b8a7e'), moss = new THREE.Color('#5f8f3a'), c = new THREE.Color();
+  for (let i = 0; i < p.count; i++) {
+    c.copy(n.getY(i) > 0.45 ? moss : stone);
+    col.set([c.r, c.g, c.b], i * 3);
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return g;
+}
+const rockGeo = makeRock();
+const rockMat = std(0xffffff, { vertexColors: true });
+for (let i = 0; i < 11; i++) {
+  const [x, z] = ringPoint(POND_R + 0.9, POND_R + 2.6);
+  const rock = new THREE.Mesh(rockGeo, rockMat);
+  rock.position.set(x, groundH(x, z) - 0.15, z);
+  rock.rotation.y = rand() * Math.PI * 2;
+  rock.scale.set(rr(0.6, 1.3), rr(0.6, 1.0), rr(0.6, 1.3));
+  rock.castShadow = rock.receiveShadow = true;
+  scene.add(rock);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Dense grass (instanced, swaying)
+ * ------------------------------------------------------------------ */
+const GRASS_N = 5000;
+const bladeGeo = new THREE.ConeGeometry(0.06, 0.7, 3, 1, false).translate(0, 0.35, 0);
+const grass = new THREE.InstancedMesh(bladeGeo, sway(std(0xffffff), 0.12, 1.4), GRASS_N);
+const grassCols = ['#6f9a3e', '#8fb24d', '#56813a', '#a3b85a', '#7aa545'];
+const cc = new THREE.Color();
+for (let i = 0; i < GRASS_N; i++) {
+  const [x, z] = ringPoint(POND_R + 1.2, 26);
+  const sc = rr(0.7, 1.5);
+  place(grass, i, x, groundH(x, z), z, rr(0, Math.PI * 2), sc * rr(0.8, 1.2), sc * rr(0.8, 1.3), sc * rr(0.8, 1.2), rr(-0.2, 0.2), rr(-0.2, 0.2));
+  grass.setColorAt(i, cc.set(pick(grassCols)));
+}
+grass.instanceMatrix.needsUpdate = true;
+grass.instanceColor.needsUpdate = true;
+grass.receiveShadow = true;
+scene.add(grass);
+
+/* ------------------------------------------------------------------ *
+ *  Small colorful flowers (stem + bloom, merged)
+ * ------------------------------------------------------------------ */
+const flowerGeo = mergeGeometries([
+  paint(new THREE.CylinderGeometry(0.008, 0.008, 0.35, 3).toNonIndexed().translate(0, 0.175, 0), '#6c9a3c'),
+  paint(new THREE.IcosahedronGeometry(0.07, 0).toNonIndexed().translate(0, 0.36, 0), '#ffffff'),
+]);
+const FLOWER_N = 650;
+const flowers = new THREE.InstancedMesh(flowerGeo, sway(std(0xffffff, { vertexColors: true }), 0.12, 1.6), FLOWER_N);
+const flowerCols = ['#ff6fa3', '#ffd34d', '#ffffff', '#c58cff', '#ff9a3c', '#6fd3ff'];
+for (let i = 0; i < FLOWER_N; i++) {
+  const [x, z] = ringPoint(POND_R + 1.5, 24);
+  const sc = rr(0.9, 1.3);
+  place(flowers, i, x, groundH(x, z), z, rr(0, Math.PI * 2), sc, sc, sc);
+  flowers.setColorAt(i, cc.set(pick(flowerCols)));
+}
+flowers.instanceMatrix.needsUpdate = true;
+flowers.instanceColor.needsUpdate = true;
+scene.add(flowers);
+
+/* ------------------------------------------------------------------ *
+ *  Reeds and cattails at the water's edge
+ * ------------------------------------------------------------------ */
+const reedGeo = mergeGeometries([
+  paint(new THREE.CylinderGeometry(0.018, 0.026, 1, 4).translate(0, 0.5, 0), '#7d9a45'),
+  paint(new THREE.CylinderGeometry(0.05, 0.05, 0.22, 5).translate(0, 0.86, 0), '#5a3b22'),
+]);
+const REED_N = 220;
+const reeds = new THREE.InstancedMesh(reedGeo, sway(std(0xffffff, { vertexColors: true }), 0.1, 1.2), REED_N);
+for (let i = 0; i < REED_N; i++) {
+  const [x, z] = ringPoint(POND_R - 0.2, POND_R + 1.2);
+  const base = Math.max(groundH(x, z), WATER_Y - 0.25);   // reeds grow out of the water
+  const h = rr(1.4, 2.4);
+  place(reeds, i, x, base, z, rr(0, Math.PI * 2), rr(0.8, 1.1), h, rr(0.8, 1.1), rr(-0.08, 0.08), rr(-0.08, 0.08));
+}
+reeds.instanceMatrix.needsUpdate = true;
+reeds.castShadow = true;
+scene.add(reeds);
+
+/* ------------------------------------------------------------------ *
+ *  Lily pads (with a few pink blooms)
+ * ------------------------------------------------------------------ */
+const padGeo = new THREE.CircleGeometry(0.55, 9, 0.35, Math.PI * 2 - 0.7).rotateX(-Math.PI / 2);
+const PAD_N = 46;
+const pads = new THREE.InstancedMesh(padGeo, std('#5f9a4a', { side: THREE.DoubleSide }), PAD_N);
+const padSpots = [];
+for (let i = 0; i < PAD_N; i++) {
+  const [x, z] = ringPoint(1.2, POND_R - 0.8);
+  padSpots.push([x, z]);
+  place(pads, i, x, WATER_Y + 0.03, z, rand() * Math.PI * 2, rr(0.8, 1.3), 1, rr(0.8, 1.3));
+}
+pads.instanceMatrix.needsUpdate = true;
+scene.add(pads);
+
+const lotusGeo = new THREE.IcosahedronGeometry(0.12, 0).scale(1, 0.6, 1);
+const lotus = new THREE.InstancedMesh(lotusGeo, std('#f7a1c4'), 10);
+for (let i = 0; i < 10; i++) {
+  const [x, z] = padSpots[i * 4];
+  place(lotus, i, x, WATER_Y + 0.12, z);
+}
+lotus.instanceMatrix.needsUpdate = true;
+scene.add(lotus);
+
+/* ------------------------------------------------------------------ *
+ *  Wooden dock with a bench
+ * ------------------------------------------------------------------ */
+const dock = new THREE.Group();
+const DL = 5, DW = 1.6;
+const wood = std('#8a6040'), woodDark = std('#5a3d27');
+for (let i = 0; i < 6; i++) {                                    // planks
+  const plank = new THREE.Mesh(new THREE.BoxGeometry(DL, 0.12, 0.24), wood);
+  plank.position.set(-DL / 2, 0.1, -DW / 2 + 0.12 + i * 0.27);
+  plank.castShadow = plank.receiveShadow = true;
+  dock.add(plank);
+}
+for (const x of [-0.25, -DL / 2, -DL + 0.25])                    // pilings
+  for (const z of [-DW / 2 + 0.1, DW / 2 - 0.1]) {
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.2, 2.6, 0.2), woodDark);
+    post.position.set(x, -0.9, z);
+    post.castShadow = true;
+    dock.add(post);
+  }
+const bx = -DL + 1.1;                                            // bench
+const seat = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.09, 0.42), wood);
+seat.position.set(bx, 0.5, 0);
+const backrest = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.5, 0.07), wood);
+backrest.position.set(bx, 0.78, -0.2);
+dock.add(seat, backrest);
+for (const lx of [-0.55, 0.55]) {
+  const leg = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.42, 0.42), woodDark);
+  leg.position.set(bx + lx, 0.3, 0);
+  dock.add(leg);
+}
+dock.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+dock.position.set(Math.cos(DOCK_A) * (POND_R + 0.8), 0, Math.sin(DOCK_A) * (POND_R + 0.8));
+dock.rotation.y = -DOCK_A;                                      // local −x points into the pond
+scene.add(dock);
+
+/* ------------------------------------------------------------------ *
+ *  Butterflies (flapping, drifting)
+ * ------------------------------------------------------------------ */
+const wingGeo = new THREE.PlaneGeometry(0.22, 0.17).translate(0.11, 0, 0);
+const bodyGeo = new THREE.BoxGeometry(0.02, 0.02, 0.16);
+const bodyMat = std('#2a2030');
+const butterflyCols = ['#ff7fb0', '#ffd34d', '#7fd1ff', '#ff9a3c', '#c08cff'];
+const butterflies = [];
+
+const flyPos = (cx, cz, h, a) => new THREE.Vector3(
+  cx + 2.2 * Math.cos(a) + 0.8 * Math.cos(3 * a),
+  h + 0.3 * Math.sin(2 * a),
+  cz + 2.2 * Math.sin(1.3 * a)
+);
+
+for (let i = 0; i < 7; i++) {
+  const color = butterflyCols[i % butterflyCols.length];
+  const wm = new THREE.MeshStandardMaterial({
+    color, emissive: color, emissiveIntensity: 0.25, side: THREE.DoubleSide, roughness: 0.5, flatShading: true,
+  });
+  const b = new THREE.Group();
+  const pl = new THREE.Group(), pr = new THREE.Group();
+  pl.add(new THREE.Mesh(wingGeo, wm));
+  pr.add(new THREE.Mesh(wingGeo, wm));
+  b.add(pl, pr, new THREE.Mesh(bodyGeo, bodyMat));
+  const [cx, cz] = ringPoint(3, 14);
+  b.userData = { cx, cz, phase: rand() * 10, speed: rr(0.25, 0.5), h: rr(0.8, 2.2), pl, pr };
+  scene.add(b);
+  butterflies.push(b);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Birds circling high above
+ * ------------------------------------------------------------------ */
+const birdMat = std('#2b2a33');
+const birdWingGeo = new THREE.BoxGeometry(1.0, 0.03, 0.22).translate(0.5, 0, 0);
+const birdBodyGeo = new THREE.BoxGeometry(0.14, 0.12, 0.7);
+const birds = [];
+for (let i = 0; i < 6; i++) {
+  const b = new THREE.Group();
+  const pl = new THREE.Group(), pr = new THREE.Group();
+  pl.add(new THREE.Mesh(birdWingGeo, birdMat));
+  const rightWing = new THREE.Mesh(birdWingGeo, birdMat);
+  rightWing.scale.x = -1;                                        // mirrored to the right
+  pr.add(rightWing);
+  b.add(pl, pr, new THREE.Mesh(birdBodyGeo, birdMat));
+  b.userData = { i, pl, pr };
+  scene.add(b);
+  birds.push(b);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Loop
+ * ------------------------------------------------------------------ */
+const clock = new THREE.Clock();
+const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3();
+
+function animate() {
+  const t = clock.getElapsedTime();
+  wind.value = t;
+
+  for (const b of butterflies) {
+    const { cx, cz, phase, speed, h, pl, pr } = b.userData;
+    const a = t * speed + phase;
+    b.position.copy(flyPos(cx, cz, h, a));
+    b.lookAt(flyPos(cx, cz, h, a + 0.05 * speed));
+    const w = 0.2 + 0.8 * Math.abs(Math.sin(t * 12 + phase));   // wing squash = flap
+    pl.scale.x = w;
+    pr.scale.x = -w;
+  }
+
+  for (const b of birds) {
+    const { i, pl, pr } = b.userData;
+    const a = t * 0.25 + i * 1.05, R = 26 + i * 1.5;
+    tmpA.set(Math.cos(a) * R, 13 + Math.sin(a * 2 + i) * 1.5 + i * 0.4, Math.sin(a) * R);
+    tmpB.set(-Math.sin(a), 0, Math.cos(a));                       // tangent = heading
+    b.position.copy(tmpA);
+    b.lookAt(tmpA.clone().add(tmpB));
+    const flap = Math.sin(t * 9 + i) * 0.5;
+    pl.rotation.z = flap;
+    pr.rotation.z = -flap;
+  }
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(animate);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
